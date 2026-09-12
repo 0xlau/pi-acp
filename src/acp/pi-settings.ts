@@ -27,7 +27,7 @@ function readJsonFile(path: string): Record<string, unknown> {
   }
 }
 
-function getMergedSettings(cwd: string): Record<string, unknown> {
+export function getMergedSettings(cwd: string): Record<string, unknown> {
   const globalSettingsPath = join(getAgentDir(), 'settings.json')
   const projectSettingsPath = resolve(cwd, '.pi', 'settings.json')
 

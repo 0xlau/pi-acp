@@ -27,7 +27,10 @@ export function toAvailableCommandsFromPiGetCommands(
   raw: PiRpcCommandInfo[]
 } {
   const enableSkillCommands = opts?.enableSkillCommands ?? true
-  const includeExtensionCommands = opts?.includeExtensionCommands ?? false
+  // Extension commands (e.g. `/goal` from pi-goal-x) are advertised by default: pi-acp can
+  // render the dialog subset they use (select/confirm/input/editor) via ACP elicitation.
+  // Set `piAcp.extensionCommands: false` or PI_ACP_EXTENSION_COMMANDS=0 to hide them.
+  const includeExtensionCommands = opts?.includeExtensionCommands ?? true
 
   const root: any = data
   const commandsRaw: PiRpcCommandInfo[] = Array.isArray(root?.commands)

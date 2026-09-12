@@ -1,8 +1,8 @@
 import type {
   AgentSideConnection,
+  ClientCapabilities,
   ContentBlock,
   McpServer,
-  PermissionOption,
   SessionUpdate,
   ToolCallContent,
   ToolCallLocation,
@@ -11,8 +11,11 @@ import type {
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import { DEFAULT_ACP_SETTINGS, type AcpSettings } from './acp-settings.js'
 import { maybeAuthRequiredError } from './auth-required.js'
+import { createExtensionUiBridge, readExtensionUiCapabilities, type ExtensionUiBridge } from './extension-ui.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
@@ -34,9 +37,21 @@ type SessionCreateParams = {
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  /** Client capabilities from `initialize`; picks the extension UI mechanism. */
+  clientCapabilities?: ClientCapabilities | null
+  /** Resolved pi-acp settings for this session cwd. */
+  acpSettings?: AcpSettings
 }
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
+
+/**
+ * Cumulative grace probes (ms) used when pi's `prompt` acknowledgement arrives without an
+ * agent loop. An extension command such as `/goal-list` produces no `agent_start`, so this
+ * is the only signal that the turn is over. `agent_start` for a real turn lands in the same
+ * tick as the acknowledgement, so the first probe at 120ms is already conclusive.
+ */
+const COMMAND_ONLY_SETTLE_PROBE_DELAYS_MS = [120, 250, 500]
 
 type PendingTurn = {
   resolve: (reason: StopReason) => void
@@ -49,15 +64,6 @@ type QueuedTurn = {
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
 }
-
-type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
-
-const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
-  { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
-  { optionId: 'no', name: 'No', kind: 'reject_once' }
-]
-const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
-const CHOICE_OPTION_PREFIX = 'choice-'
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
@@ -220,7 +226,9 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      clientCapabilities: params.clientCapabilities,
+      acpSettings: params.acpSettings
     })
 
     this.sessions.set(sessionId, session)
@@ -247,7 +255,9 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      clientCapabilities: params.clientCapabilities,
+      acpSettings: params.acpSettings
     })
 
     this.sessions.set(sessionId, session)
@@ -296,6 +306,10 @@ export class PiAcpSession {
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
 
+  // Bridges pi's extension UI sub-protocol onto ACP (dialogs + fire-and-forget).
+  // See src/acp/extension-ui.ts for the supported method table.
+  private readonly extensionUi: ExtensionUiBridge
+
   constructor(opts: {
     sessionId: string
     cwd: string
@@ -303,6 +317,8 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    clientCapabilities?: ClientCapabilities | null
+    acpSettings?: AcpSettings
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -310,6 +326,16 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+
+    const { supportsElicitationForm } = readExtensionUiCapabilities(opts.clientCapabilities)
+    this.extensionUi = createExtensionUiBridge({
+      conn: opts.conn,
+      sessionId: opts.sessionId,
+      proc: opts.proc,
+      mode: (opts.acpSettings ?? DEFAULT_ACP_SETTINGS).extensionUi,
+      supportsElicitationForm,
+      emit: update => this.emit(update)
+    })
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -486,30 +512,92 @@ export class PiAcpSession {
     // Kick off pi, but completion is determined by pi events, not the RPC response.
     // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
     // continuations may emit multiple `agent_end` events before `agent_settled`.
-    this.proc.prompt(t.message, t.images).catch(err => {
-      // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
-      // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
-        // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-        const authErr = maybeAuthRequiredError(err)
-        if (authErr) {
-          this.pendingTurn?.reject(authErr)
-        } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
-        }
+    this.proc
+      .prompt(t.message, t.images)
+      .then(() => {
+        // Extension commands that never start an agent loop emit no `agent_settled`,
+        // so probe for an idle session instead of leaving the ACP turn pending forever.
+        void this.finishTurnIfNoAgentLoop()
+      })
+      .catch(err => {
+        // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
+        // Also ensure we flush any already-enqueued updates first.
+        void this.flushEmits().finally(() => {
+          // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
+          const authErr = maybeAuthRequiredError(err)
+          if (authErr) {
+            this.pendingTurn?.reject(authErr)
+          } else {
+            const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
+            this.pendingTurn?.resolve(reason)
+          }
 
-        this.pendingTurn = null
-        this.inAgentLoop = false
+          this.pendingTurn = null
+          this.inAgentLoop = false
 
-        // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-        // But we still clear the queueDepth metadata.
+          // If the prompt failed, do not automatically proceed—pi may be unhealthy.
+          // But we still clear the queueDepth metadata.
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          })
+        })
+        void err
+      })
+  }
+
+  /**
+   * Resolve the ACP turn for prompts that pi handled without starting an agent loop
+   * (extension commands such as `/goal-list`, `/goal-status`, `/subagents-models`).
+   *
+   * pi's `prompt` response only acknowledges acceptance, and command-only turns never emit
+   * `agent_settled`. Probing `get_state` for an idle session after a short grace window is
+   * the only reliable completion signal; if an agent turn is actually running, `agent_start`
+   * has already set {@link inAgentLoop} and this bails out.
+   */
+  private async finishTurnIfNoAgentLoop(): Promise<void> {
+    for (const delay of COMMAND_ONLY_SETTLE_PROBE_DELAYS_MS) {
+      await sleep(delay)
+      if (this.inAgentLoop || this.pendingTurn === null) return
+
+      const state: any = await this.proc.getState().catch(() => null)
+      if (!state) return
+      if (state.isStreaming || state.isCompacting) return
+      const pending = state.pendingMessageCount
+      if (typeof pending === 'number' && pending > 0) return
+    }
+
+    if (this.inAgentLoop || this.pendingTurn === null) return
+    this.finishTurn('end_turn')
+  }
+
+  /**
+   * Resolve the in-flight turn, then start the next queued prompt (if any).
+   * Used by both `agent_settled` and {@link finishTurnIfNoAgentLoop}.
+   */
+  private finishTurn(reason: StopReason): void {
+    // Ensure all updates derived from pi events are delivered before we resolve
+    // the ACP `session/prompt` request.
+    void this.flushEmits().finally(() => {
+      const effective: StopReason = this.cancelRequested ? 'cancelled' : reason
+      this.pendingTurn?.resolve(effective)
+      this.pendingTurn = null
+      this.inAgentLoop = false
+
+      // Start next queued prompt, if any.
+      const next = this.turnQueue.shift()
+      if (next) {
+        this.emit({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+        })
+        this.startTurn(next)
+      } else {
         this.emit({
           sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+          _meta: { piAcp: { queueDepth: 0, running: false } }
         })
-      })
-      void err
+      }
     })
   }
 
@@ -837,29 +925,7 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
-        // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
-
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
-        })
+        this.finishTurn('end_turn')
         break
       }
 
@@ -868,140 +934,20 @@ export class PiAcpSession {
     }
   }
 
+  /**
+   * Delegate one `extension_ui_request` to the ACP bridge.
+   *
+   * The bridge is responsible for answering dialog methods exactly once and for never
+   * answering fire-and-forget methods (`notify`, `setStatus`, ...). It never throws.
+   */
   private async handleExtensionUiRequest(ev: PiRpcEvent): Promise<void> {
-    const id = stringProp(ev, 'id')
-    const method = stringProp(ev, 'method')
-    if (!id) {
-      return
-    }
-
-    if (method === 'select') {
-      await this.handleExtensionSelect(ev, id)
-      return
-    }
-
-    if (method === 'confirm') {
-      await this.handleExtensionConfirm(ev, id)
-      return
-    }
-
-    if (method === 'input' || method === 'editor') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: {
-          type: 'text',
-          text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
-        } satisfies ContentBlock
-      })
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
-      return
-    }
-
-    if (method === 'notify') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: stringProp(ev, 'message') ?? 'Pi notification' } satisfies ContentBlock,
-        _meta: { piAcp: { notify: { level: stringProp(ev, 'notifyType') ?? 'info' } } }
-      })
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
-      return
-    }
-
-    await this.proc.sendExtensionUiResponse({ id, cancelled: true })
-  }
-
-  private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {
-    const rawOptions = ev.options
-    const options = Array.isArray(rawOptions) ? rawOptions.map(option => String(option)) : []
-    if (!options.length) {
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
-      return
-    }
-
-    const permissionOptions: PermissionOption[] = options.map((name, index) => ({
-      optionId: `${CHOICE_OPTION_PREFIX}${index}`,
-      name,
-      kind: 'allow_once'
-    }))
-
-    const selected = await this.requestExtensionPermission(id, ev, permissionOptions)
-    if (selected === null) {
-      return
-    }
-
-    const selectedOptionId = selected.outcome.outcome === 'selected' ? selected.outcome.optionId : null
-    const index = selectedOptionId === null ? null : optionIndex(selectedOptionId)
-    const value = index === null ? null : (options.at(index) ?? null)
-    await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value })
-  }
-
-  private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
-    const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
-    if (selected === null) {
-      return
-    }
-
-    if (selected.outcome.outcome === 'cancelled') {
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
-      return
-    }
-
-    await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'yes' })
-  }
-
-  private async requestExtensionPermission(
-    id: string,
-    ev: PiRpcEvent,
-    options: PermissionOption[]
-  ): Promise<PermissionResponse | null> {
-    try {
-      return await this.conn.requestPermission({
-        sessionId: this.sessionId,
-        toolCall: extensionUiToolCall(id, ev),
-        options
-      })
-    } catch {
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
-      return null
-    }
-  }
-}
-
-function extensionUiToolCall(id: string, ev: PiRpcEvent) {
-  const method = stringProp(ev, 'method') ?? 'ui'
-  const title = stringProp(ev, 'title') ?? `Pi ${method}`
-  const rawInput: Record<string, unknown> = { method }
-
-  for (const key of EXTENSION_UI_RAW_INPUT_KEYS) {
-    if (Object.hasOwn(ev, key)) rawInput[key] = ev[key]
-  }
-
-  return {
-    toolCallId: `pi-ui-${id}`,
-    title,
-    kind: 'other' as const,
-    status: 'pending' as const,
-    rawInput
+    await this.extensionUi.handle(ev)
   }
 }
 
 function stringProp(source: Record<string, unknown>, key: string): string | null {
   const value = source[key]
   return typeof value === 'string' ? value : null
-}
-
-function optionIndex(optionId: string): number | null {
-  if (!optionId.startsWith(CHOICE_OPTION_PREFIX)) {
-    return null
-  }
-
-  const rawIndex = optionId.slice(CHOICE_OPTION_PREFIX.length)
-  if (!rawIndex) {
-    return null
-  }
-
-  const index = Number(rawIndex)
-  return Number.isSafeInteger(index) && index >= 0 && String(index) === rawIndex ? index : null
 }
 
 function formatAutoRetryMessage(ev: PiRpcEvent): string {

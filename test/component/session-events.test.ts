@@ -241,7 +241,7 @@ test('PiAcpSession: sends cancelled response when ACP confirm is cancelled', asy
   assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-5', cancelled: true }])
 })
 
-test('PiAcpSession: cancels unsupported input and editor extension UI requests with visible fallback', async () => {
+test('PiAcpSession: cancels input and editor extension UI requests when the client cannot elicit', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -264,8 +264,64 @@ test('PiAcpSession: cancels unsupported input and editor extension UI requests w
     { id: 'ui-4', cancelled: true }
   ])
   assert.equal(conn.updates.length, 2)
-  assert.match((conn.updates[0]!.update as any).content.text, /input UI request is not supported/)
-  assert.match((conn.updates[1]!.update as any).content.text, /editor UI request is not supported/)
+  assert.match((conn.updates[0]!.update as any).content.text, /cannot show free-form text input/)
+  assert.match((conn.updates[1]!.update as any).content.text, /cannot show free-form text input/)
+})
+
+test('PiAcpSession: bridges select/input through elicitation when the client advertises form support', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextElicitationResponse = { action: 'accept', content: { value: 'Beta' } }
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    clientCapabilities: { elicitation: { form: {} } } as any
+  })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-6',
+    method: 'select',
+    title: 'Pick one',
+    options: ['Alpha', 'Beta']
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.permissionRequests.length, 0)
+  assert.equal(conn.elicitationRequests.length, 1)
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-6', value: 'Beta' }])
+})
+
+test('PiAcpSession: does not answer fire-and-forget extension UI requests', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-7',
+    method: 'setStatus',
+    statusKey: 'goal',
+    statusText: 'drafting'
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(proc.extensionUiResponses, [])
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
@@ -870,7 +926,8 @@ test('PiAcpSession: tags extension notify chunks with severity in _meta', async 
     content: { type: 'text', text: 'MCP: connection failed' },
     _meta: { piAcp: { notify: { level: 'error' } } }
   })
-  assert.deepEqual(proc.extensionUiResponses[0], { id: 'n1', cancelled: true })
+  // `notify` is fire-and-forget: answering it would leak an unmatched response into pi.
+  assert.deepEqual(proc.extensionUiResponses, [])
 })
 
 test('PiAcpSession: defaults notify severity to info when notifyType is absent', async () => {
@@ -899,4 +956,58 @@ test('PiAcpSession: defaults notify severity to info when notifyType is absent',
   assert.deepEqual((conn.updates[0]!.update as any)._meta, {
     piAcp: { notify: { level: 'info' } }
   })
+})
+
+test('PiAcpSession: command-only turn (no agent loop) resolves instead of hanging', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let stateCalls = 0
+  ;(proc as any).getState = async () => {
+    stateCalls += 1
+    return { isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  // pi acknowledges the prompt but never emits agent_start/agent_settled (e.g. `/goal-list`).
+  const reason = await session.prompt('/goal-list')
+
+  assert.equal(reason, 'end_turn')
+  assert.ok(stateCalls >= 1, 'expected the settle probe to consult pi session state')
+})
+
+test('PiAcpSession: settle probe leaves a running agent turn open until agent_settled', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  ;(proc as any).getState = async () => ({ isStreaming: true, isCompacting: false, pendingMessageCount: 0 })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  proc.emit({ type: 'agent_start' })
+  // Longer than the whole probe window: the probe must not close a live turn.
+  await new Promise(r => setTimeout(r, 950))
+  assert.equal(resolved, false)
+
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await p, 'end_turn')
 })

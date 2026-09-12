@@ -4,6 +4,28 @@ ACP ([Agent Client Protocol](https://agentclientprotocol.com/overview/introducti
 
 `pi-acp` communicates **ACP JSON-RPC 2.0 over stdio** to an ACP client (e.g. Zed editor) and spawns `pi --mode rpc`, bridging requests/events between the two.
 
+## Fork differences
+
+This is [0xlau](https://github.com/0xlau/pi-acp)'s fork of
+[svkozak/pi-acp](https://github.com/svkozak/pi-acp). On top of upstream `0.0.33` it adds:
+
+- **Extension commands are advertised by default** (upstream hides every command whose
+  `source` is `extension`). `/goal`, `/subagents`, `/websearch`, ... now appear in the ACP
+  client's `/` menu. Opt out with `piAcp.extensionCommands: false` or
+  `PI_ACP_EXTENSION_COMMANDS=0`.
+- **Extension dialogs are bridged through ACP elicitation**, so `input` and `editor`
+  actually work instead of being cancelled. This is what makes pi's guided `/goal` flow
+  usable from an editor. See [Extension UI](#extension-ui).
+- **Command-only turns complete.** Extension commands that never start an agent loop no
+  longer leave the ACP prompt hanging. See
+  [Turn completion for command-only prompts](#turn-completion-for-command-only-prompts).
+- **Fire-and-forget requests are no longer answered** (`notify`, `setStatus`, `setWidget`,
+  `setTitle`, `set_editor_text`), matching pi's RPC contract.
+- `piAcp` settings block with env overrides, resolved per session cwd.
+
+Upstream rationale for the old behaviour is in
+[svkozak/pi-acp#20](https://github.com/svkozak/pi-acp/pull/20).
+
 ## Status
 
 This is an MVP-style adapter intended to be useful today and easy to iterate on. Some ACP features may be not implemented or are not supported (see [Limitations](#limitations)). Development is centered around [Zed](https://zed.dev) editor support, other clients may have varying levels of compatibility.
@@ -163,7 +185,113 @@ Other built-in commands:
 
 - Skill commands can be enabled in pi settings and will appear in the slash command list in ACP client as `/skill:skill-name`.
 
-**Note**: Slash commands provided by pi extensions are not currently supported.
+#### 4) Extension commands
+
+Commands registered by pi extensions (`pi.registerCommand()`, for example `/goal` from
+`pi-goal-x`, or `/subagents` from `pi-subagents`) are read from pi's `get_commands` RPC and
+advertised to the ACP client, so they show up in the `/` menu and execute normally.
+
+They are advertised **by default**. If you prefer a smaller command list, turn them off in
+pi settings or via the environment:
+
+```json
+{
+  "piAcp": { "extensionCommands": false }
+}
+```
+
+```bash
+PI_ACP_EXTENSION_COMMANDS=0 pi-acp
+```
+
+Extension **dialogs** are bridged to the client as well — see [Extension UI](#extension-ui).
+
+## Extension UI
+
+pi extensions interact with the user through `ctx.ui.*` (`select`, `confirm`, `input`,
+`editor`, `notify`, ...). In RPC mode pi turns those into `extension_ui_request` events;
+`pi-acp` maps them onto ACP:
+
+| pi method                                               | ACP mechanism                                                                                                     |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `select`                                                | elicitation form (single-select enum), or `session/request_permission` for clients without elicitation            |
+| `confirm`                                               | elicitation form (boolean), or `session/request_permission` for clients without elicitation                       |
+| `input`                                                 | elicitation form (string, `placeholder` as description)                                                           |
+| `editor`                                                | elicitation form (string, `prefill` as default)                                                                   |
+| `notify`                                                | `agent_message_chunk`, tagged with `_meta.piAcp.notify.level`                                                     |
+| `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | no ACP surface; dropped silently (echoed when `PI_ACP_EXTENSION_UI_DEBUG=1`)                                      |
+| `custom`                                                | not renderable over ACP (pi already returns `undefined` for `custom()` in RPC mode); declined with an explanation |
+
+Dialog methods are always answered exactly once so extension promises settle; fire-and-forget
+methods are never answered. If pi includes a `timeout` on a dialog, `pi-acp` stops waiting at
+the same deadline without sending a response, because pi resolves its own side.
+
+Configure the strategy with:
+
+```json
+{
+  "piAcp": { "extensionUi": "auto" }
+}
+```
+
+- `auto` (default): elicitation when the client advertises `clientCapabilities.elicitation.form`, otherwise permission dialogs where possible.
+- `permission`: never use elicitation. `select`/`confirm` use permission dialogs; `input`/`editor` are declined with an explanation.
+- `off`: never prompt. Every dialog is declined with an explanation.
+
+Environment overrides: `PI_ACP_EXTENSION_UI=auto|permission|off`,
+`PI_ACP_EXTENSION_COMMANDS=0|1`, `PI_ACP_EXTENSION_UI_DEBUG=1`. Precedence is
+environment > project `.pi/settings.json` > `~/.pi/agent/settings.json` > defaults.
+
+## Turn completion for command-only prompts
+
+pi's RPC `prompt` response only acknowledges acceptance; turn completion normally comes from
+the `agent_settled` event. Extension commands that never start an agent loop (for example
+`/goal-list`, `/goal-status`, `/subagents-models`) never emit `agent_settled`, which would
+leave the ACP `session/prompt` pending forever.
+
+`pi-acp` therefore probes pi's session state (`get_state`) after the acknowledgement. If no
+agent loop started and the session is idle (`isStreaming`, `isCompacting`,
+`pendingMessageCount` all clear) the turn is completed with `end_turn`. The probe runs at
+120/370/870 ms; a real agent turn emits `agent_start` in the same tick as the
+acknowledgement, so live turns are never cut short.
+
+## Local Zed setup (this fork)
+
+Zed launches pi-acp from a stable launcher so the config does not depend on the active node
+version:
+
+```bash
+# ~/bin/pi-acp-fork
+#!/usr/bin/env bash
+set -euo pipefail
+exec /Users/liupeiqiang/.asdf/shims/node \
+  /Users/liupeiqiang/Studio/OpenSource/pi-acp/dist/index.js "$@"
+```
+
+`~/.config/zed/settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "pi-acp": {
+      "type": "custom",
+      "command": "/Users/liupeiqiang/bin/pi-acp-fork",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+After changing sources, rebuild and restart the agent in Zed:
+
+```bash
+cd /Users/liupeiqiang/Studio/OpenSource/pi-acp
+npm run build
+```
+
+The previous ACP-registry install (`.../Zed/external_agents/registry/npx/pi-acp`) has been
+removed.
 
 ## Authentication (ACP Registry support)
 

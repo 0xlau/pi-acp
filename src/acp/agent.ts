@@ -2,6 +2,7 @@ import {
   RequestError,
   type Agent as ACPAgent,
   type AgentSideConnection,
+  type ClientCapabilities,
   type AuthenticateRequest,
   type CancelNotification,
   type InitializeRequest,
@@ -23,6 +24,7 @@ import {
   type DeleteSessionRequest,
   type DeleteSessionResponse
 } from '@agentclientprotocol/sdk'
+import { resolveAcpSettings } from './acp-settings.js'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
@@ -126,6 +128,9 @@ export class PiAcpAgent implements ACPAgent {
   private readonly store = new SessionStore()
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
 
+  /** Client capabilities from `initialize`, forwarded to sessions for UI mechanism selection. */
+  private clientCapabilities: ClientCapabilities | null = null
+
   dispose(): void {
     this.sessions.disposeAll()
   }
@@ -216,7 +221,9 @@ export class PiAcpAgent implements ACPAgent {
         mcpServers: opts?.mcpServers ?? [],
         conn: this.conn,
         proc,
-        fileCommands
+        fileCommands,
+        clientCapabilities: this.clientCapabilities,
+        acpSettings: resolveAcpSettings(cwd)
       })
 
       this.lastSessionCwd = cwd
@@ -238,6 +245,9 @@ export class PiAcpAgent implements ACPAgent {
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
     const requested = params.protocolVersion
+
+    // Remembered so sessions can pick an extension UI mechanism (elicitation vs permissions).
+    this.clientCapabilities = params.clientCapabilities ?? null
 
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
@@ -278,6 +288,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const acpSettings = resolveAcpSettings(params.cwd)
 
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
@@ -285,7 +296,9 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      clientCapabilities: this.clientCapabilities,
+      acpSettings
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -401,7 +414,7 @@ export class PiAcpAgent implements ACPAgent {
           const pi = (await session.proc.getCommands()) as any
           const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands: acpSettings.extensionCommands
           })
 
           await this.conn.sessionUpdate({
@@ -945,6 +958,7 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const acpSettings = resolveAcpSettings(params.cwd)
     const session = await this.restoreSession(params.sessionId, {
       cwd: params.cwd,
       mcpServers: params.mcpServers
@@ -1080,7 +1094,7 @@ export class PiAcpAgent implements ACPAgent {
           const pi = (await proc.getCommands()) as any
           const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands: acpSettings.extensionCommands
           })
 
           await this.conn.sessionUpdate({

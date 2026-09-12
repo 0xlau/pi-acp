@@ -1,4 +1,4 @@
-import type { AgentSideConnection } from '@agentclientprotocol/sdk'
+import type { AgentSideConnection, CreateElicitationResponse } from '@agentclientprotocol/sdk'
 import type { PiRpcEvent } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
@@ -10,6 +10,11 @@ export class FakeAgentSideConnection {
     outcome: { outcome: 'selected', optionId: 'allow' }
   }
 
+  /** Extension UI elicitation spy (ACP `elicitation/create`). */
+  readonly elicitationRequests: unknown[] = []
+  nextElicitationResponse: CreateElicitationResponse = { action: 'accept', content: { value: 'Alpha' } }
+  nextElicitationError: unknown = null
+
   async sessionUpdate(msg: SessionUpdateMsg): Promise<void> {
     this.updates.push(msg)
   }
@@ -19,6 +24,12 @@ export class FakeAgentSideConnection {
   ): Promise<{ outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } }> {
     this.permissionRequests.push(params)
     return this.nextPermissionResponse
+  }
+
+  async unstable_createElicitation(params: unknown): Promise<CreateElicitationResponse> {
+    this.elicitationRequests.push(params)
+    if (this.nextElicitationError) throw this.nextElicitationError
+    return this.nextElicitationResponse
   }
 }
 
