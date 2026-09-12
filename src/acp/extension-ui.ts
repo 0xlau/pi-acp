@@ -132,17 +132,22 @@ export function createExtensionUiBridge(deps: ExtensionUiBridgeDeps): ExtensionU
   const respond = async (id: string, outcome: DialogOutcome): Promise<void> => {
     if (outcome.kind === 'no-response') return
 
-    if (outcome.kind === 'cancelled') {
-      await deps.proc.sendExtensionUiResponse({ id, cancelled: true })
-      return
+    try {
+      if (outcome.kind === 'cancelled') {
+        await deps.proc.sendExtensionUiResponse({ id, cancelled: true })
+        return
+      }
+      if (outcome.kind === 'confirmed') {
+        await deps.proc.sendExtensionUiResponse({ id, confirmed: outcome.confirmed })
+        return
+      }
+      await deps.proc.sendExtensionUiResponse(
+        outcome.value === undefined ? { id, cancelled: true } : { id, value: outcome.value }
+      )
+    } catch {
+      // Swallow: `handle` must never reject. If it did, a caller-level fallback would send a
+      // second response for the same id, violating "answer exactly once".
     }
-    if (outcome.kind === 'confirmed') {
-      await deps.proc.sendExtensionUiResponse({ id, confirmed: outcome.confirmed })
-      return
-    }
-    await deps.proc.sendExtensionUiResponse(
-      outcome.value === undefined ? { id, cancelled: true } : { id, value: outcome.value }
-    )
   }
 
   const explain = (text: string): void => {
@@ -422,6 +427,8 @@ async function elicit(
 
   if (settled.timedOut) {
     // pi auto-resolves its own side when `timeout` expires, so we must NOT answer here.
+    // ACP has no "dismiss a form elicitation" request, so the client may keep showing the
+    // stale form; a late answer is simply discarded (no second response is ever sent).
     return { status: 'timeout' }
   }
 

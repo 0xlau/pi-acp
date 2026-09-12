@@ -50,6 +50,9 @@ export type StopReason = 'end_turn' | 'cancelled' | 'error'
  * agent loop. An extension command such as `/goal-list` produces no `agent_start`, so this
  * is the only signal that the turn is over. `agent_start` for a real turn lands in the same
  * tick as the acknowledgement, so the first probe at 120ms is already conclusive.
+ *
+ * The probe needs `get_state` to report `isStreaming`/`pendingMessageCount`; when it does
+ * not, the turn is left open (see {@link PiAcpSession.finishTurnIfNoAgentLoop}).
  */
 const COMMAND_ONLY_SETTLE_PROBE_DELAYS_MS = [120, 250, 500]
 
@@ -554,20 +557,31 @@ export class PiAcpSession {
    * `agent_settled`. Probing `get_state` for an idle session after a short grace window is
    * the only reliable completion signal; if an agent turn is actually running, `agent_start`
    * has already set {@link inAgentLoop} and this bails out.
+   *
+   * The probe is deliberately fail-closed: it completes the turn only on an explicit idle
+   * signal. Closing a live turn early is worse than leaving a command-only turn open, and an
+   * unrecognised/absent state field must never be read as "idle".
    */
   private async finishTurnIfNoAgentLoop(): Promise<void> {
+    // Bind the probe to the turn it was scheduled for: a probe that outlives its turn must
+    // not resolve a turn that started afterwards.
+    const turn = this.pendingTurn
+    if (!turn) return
+
     for (const delay of COMMAND_ONLY_SETTLE_PROBE_DELAYS_MS) {
       await sleep(delay)
-      if (this.inAgentLoop || this.pendingTurn === null) return
+      if (this.inAgentLoop || this.pendingTurn !== turn) return
 
       const state: any = await this.proc.getState().catch(() => null)
       if (!state) return
-      if (state.isStreaming || state.isCompacting) return
+      // Require positive evidence of an idle session.
+      if (state.isStreaming !== false) return
+      if (state.isCompacting === true) return
       const pending = state.pendingMessageCount
-      if (typeof pending === 'number' && pending > 0) return
+      if (typeof pending !== 'number' || pending > 0) return
     }
 
-    if (this.inAgentLoop || this.pendingTurn === null) return
+    if (this.inAgentLoop || this.pendingTurn !== turn) return
     this.finishTurn('end_turn')
   }
 

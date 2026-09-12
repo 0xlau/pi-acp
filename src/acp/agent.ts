@@ -379,14 +379,15 @@ export class PiAcpAgent implements ACPAgent {
           updateNotice
         })
 
-    if (preludeText)
+    if (preludeText) {
       session.setStartupInfo(preludeText)
+    }
 
-      // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
-      // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
-      // It does NOT affect other client windows because they run in separate agent processes.
-      //
-      // (Tests sometimes stub out `this.sessions`, so guard the call.)
+    // Policy: within a single ACP connection (one client window), keep only one live pi subprocess.
+    // This avoids leaking subprocesses when clients start new sessions but don't explicitly close old ones.
+    // It does NOT affect other client windows because they run in separate agent processes.
+    //
+    // (Tests sometimes stub out `this.sessions`, so guard the call.)
     ;(this.sessions as any).closeAllExcept?.(session.sessionId)
 
     const response = {

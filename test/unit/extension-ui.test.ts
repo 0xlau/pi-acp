@@ -349,3 +349,25 @@ test('extension-ui: requests without an id are ignored', async () => {
   assert.equal(await bridge.handle({ type: 'extension_ui_request', method: 'select' }), false)
   assert.deepEqual(proc.extensionUiResponses, [])
 })
+
+test('extension-ui: a failing response write does not reject handle (no double answer)', async () => {
+  const { conn, proc, bridge } = makeBridge()
+  const attempts: unknown[] = []
+  ;(proc as any).sendExtensionUiResponse = async (response: unknown) => {
+    attempts.push(response)
+    throw new Error('broken pipe')
+  }
+
+  await assert.doesNotReject(() =>
+    bridge.handle({
+      type: 'extension_ui_request',
+      id: 'ui-22',
+      method: 'confirm',
+      title: 'Continue?'
+    })
+  )
+
+  // Exactly one write attempt: the caller-level fallback must never add a second response.
+  assert.equal(attempts.length, 1)
+  assert.equal(conn.updates.length, 0)
+})

@@ -1011,3 +1011,66 @@ test('PiAcpSession: settle probe leaves a running agent turn open until agent_se
   proc.emit({ type: 'agent_settled' })
   assert.equal(await p, 'end_turn')
 })
+
+test('PiAcpSession: settle probe stays open when pi session state is uninformative', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  // FakePiRpcProcess.getState() resolves `{}` by default: no isStreaming/pendingMessageCount.
+  // An unknown field must never be read as "idle" (closing a live turn early is worse than
+  // leaving a command-only turn open).
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('hello').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // Longer than the whole probe window.
+  await new Promise(r => setTimeout(r, 950))
+  assert.equal(resolved, false)
+
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: probe completes each queued command-only turn exactly once', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  ;(proc as any).getState = async () => ({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const reasons: string[] = []
+  const first = session.prompt('/goal-list').then(r => {
+    reasons.push(`first:${r}`)
+    return r
+  })
+  const second = session.prompt('/goal-status').then(r => {
+    reasons.push(`second:${r}`)
+    return r
+  })
+
+  assert.equal(await first, 'end_turn')
+  assert.equal(await second, 'end_turn')
+
+  // Give a stale probe a chance to resolve an already-completed turn.
+  await new Promise(r => setTimeout(r, 950))
+  assert.deepEqual(reasons, ['first:end_turn', 'second:end_turn'])
+})
