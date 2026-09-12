@@ -251,9 +251,22 @@ leave the ACP `session/prompt` pending forever.
 
 `pi-acp` therefore probes pi's session state (`get_state`) after the acknowledgement. If no
 agent loop started and the session is idle (`isStreaming`, `isCompacting`,
-`pendingMessageCount` all clear) the turn is completed with `end_turn`. The probe runs at
-120/370/870 ms; a real agent turn emits `agent_start` in the same tick as the
-acknowledgement, so live turns are never cut short.
+`pendingMessageCount` all clear) the turn is completed with `end_turn`. The probe samples at
+120/370/870/1470 ms and gives up immediately if any sample reports work in flight.
+
+Measured on a real turn, `agent_start` lands in the **same millisecond** as the
+acknowledgement: pi only acknowledges a prompt after its preflight (auth, compaction check,
+`before_agent_start` hooks) finished and `_runAgentPrompt` set its activity flag. The window
+is insurance for the remaining case — an extension that starts its turn from a floating
+promise after the command handler returned, as pi-goal-x does in `goal-drafting.ts`.
+
+The probe is fail-closed: a sample whose payload lacks the fields above is treated as
+`unknown`, never as idle, and a single failed `get_state` is retried rather than aborting
+(one transient error must not leave the session wedged with every later prompt queued).
+
+If you ever need to trade this off, note the two failure directions: a window that is too
+short closes a live turn early, a window that is too long only adds latency to commands that
+produce no agent turn.
 
 ## Local Zed setup (this fork)
 

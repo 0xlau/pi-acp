@@ -48,13 +48,35 @@ export type StopReason = 'end_turn' | 'cancelled' | 'error'
 /**
  * Cumulative grace probes (ms) used when pi's `prompt` acknowledgement arrives without an
  * agent loop. An extension command such as `/goal-list` produces no `agent_start`, so this
- * is the only signal that the turn is over. `agent_start` for a real turn lands in the same
- * tick as the acknowledgement, so the first probe at 120ms is already conclusive.
+ * is the only signal that the turn is over.
  *
- * The probe needs `get_state` to report `isStreaming`/`pendingMessageCount`; when it does
- * not, the turn is left open (see {@link PiAcpSession.finishTurnIfNoAgentLoop}).
+ * Measured for a real turn: `agent_start` lands in the same millisecond as the
+ * acknowledgement, because pi only acknowledges a prompt once its preflight (auth,
+ * compaction check, `before_agent_start` hooks) has finished and `_runAgentPrompt` sets its
+ * activity flag. The window is therefore pure insurance against an extension that starts its
+ * turn from a floating promise after the command handler returned — kept short because it is
+ * added latency on every command-only turn.
  */
-const COMMAND_ONLY_SETTLE_PROBE_DELAYS_MS = [120, 250, 500]
+const COMMAND_ONLY_SETTLE_PROBE_DELAYS_MS = [120, 250, 500, 600]
+
+/**
+ * Classify a pi `get_state` payload.
+ *
+ * - `busy` — definite evidence that pi has work in flight; the probe gives up immediately and
+ *   lets `agent_settled` finish the turn.
+ * - `idle` — definite evidence that pi is idle.
+ * - `unknown` — the payload did not carry the fields we need. Never treated as idle, but also
+ *   never fatal: a single failed or unexpected `get_state` must not wedge the session.
+ */
+function classifySessionActivity(state: Record<string, unknown>): 'busy' | 'idle' | 'unknown' {
+  if (state.isStreaming === true || state.isCompacting === true) return 'busy'
+
+  const pending = state.pendingMessageCount
+  if (typeof pending === 'number' && pending > 0) return 'busy'
+
+  if (state.isStreaming !== false) return 'unknown'
+  return 'idle'
+}
 
 type PendingTurn = {
   resolve: (reason: StopReason) => void
@@ -558,9 +580,10 @@ export class PiAcpSession {
    * the only reliable completion signal; if an agent turn is actually running, `agent_start`
    * has already set {@link inAgentLoop} and this bails out.
    *
-   * The probe is deliberately fail-closed: it completes the turn only on an explicit idle
-   * signal. Closing a live turn early is worse than leaving a command-only turn open, and an
-   * unrecognised/absent state field must never be read as "idle".
+   * The probe is deliberately fail-closed: it completes the turn only when the last usable
+   * sample reported idle, and it never treats an unrecognised or absent state field as idle.
+   * A single failed `get_state` is retried rather than aborting, because otherwise one
+   * transient error would leave the session stuck with every later prompt queued forever.
    */
   private async finishTurnIfNoAgentLoop(): Promise<void> {
     // Bind the probe to the turn it was scheduled for: a probe that outlives its turn must
@@ -568,21 +591,20 @@ export class PiAcpSession {
     const turn = this.pendingTurn
     if (!turn) return
 
+    let lastSample: 'idle' | 'unknown' = 'unknown'
+
     for (const delay of COMMAND_ONLY_SETTLE_PROBE_DELAYS_MS) {
       await sleep(delay)
       if (this.inAgentLoop || this.pendingTurn !== turn) return
 
       const state: any = await this.proc.getState().catch(() => null)
-      if (!state) return
-      // Require positive evidence of an idle session.
-      if (state.isStreaming !== false) return
-      if (state.isCompacting === true) return
-      const pending = state.pendingMessageCount
-      if (typeof pending !== 'number' || pending > 0) return
+      const sample = state ? classifySessionActivity(state) : 'unknown'
+      if (sample === 'busy') return
+      lastSample = sample
     }
 
     if (this.inAgentLoop || this.pendingTurn !== turn) return
-    this.finishTurn('end_turn')
+    if (lastSample === 'idle') this.finishTurn('end_turn')
   }
 
   /**

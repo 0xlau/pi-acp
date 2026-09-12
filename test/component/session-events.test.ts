@@ -1005,7 +1005,7 @@ test('PiAcpSession: settle probe leaves a running agent turn open until agent_se
 
   proc.emit({ type: 'agent_start' })
   // Longer than the whole probe window: the probe must not close a live turn.
-  await new Promise(r => setTimeout(r, 950))
+  await new Promise(r => setTimeout(r, 1600))
   assert.equal(resolved, false)
 
   proc.emit({ type: 'agent_settled' })
@@ -1035,7 +1035,7 @@ test('PiAcpSession: settle probe stays open when pi session state is uninformati
   })
 
   // Longer than the whole probe window.
-  await new Promise(r => setTimeout(r, 950))
+  await new Promise(r => setTimeout(r, 1600))
   assert.equal(resolved, false)
 
   proc.emit({ type: 'agent_start' })
@@ -1071,6 +1071,64 @@ test('PiAcpSession: probe completes each queued command-only turn exactly once',
   assert.equal(await second, 'end_turn')
 
   // Give a stale probe a chance to resolve an already-completed turn.
-  await new Promise(r => setTimeout(r, 950))
+  await new Promise(r => setTimeout(r, 1600))
   assert.deepEqual(reasons, ['first:end_turn', 'second:end_turn'])
+})
+
+test('PiAcpSession: a late agent_start still keeps the turn open (floating extension turn)', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  // pi reports idle until the extension's floating sendUserMessage actually starts its run.
+  ;(proc as any).getState = async () => ({ isStreaming: false, isCompacting: false, pendingMessageCount: 0 })
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  let resolved = false
+  const p = session.prompt('/goal').then(reason => {
+    resolved = true
+    return reason
+  })
+
+  // A real turn that starts ~1s after the prompt acknowledgement (the whole probe window is
+  // 1470ms) must not be closed by the command-only probe.
+  await new Promise(r => setTimeout(r, 1000))
+  proc.emit({ type: 'agent_start' })
+
+  await new Promise(r => setTimeout(r, 1600))
+  assert.equal(resolved, false, 'the probe closed a live turn')
+
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: a transient get_state failure does not wedge a command-only turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let calls = 0
+  ;(proc as any).getState = async () => {
+    calls += 1
+    if (calls === 1) throw new Error('transient RPC failure')
+    return { isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+  }
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const reason = await session.prompt('/goal-list')
+
+  assert.equal(reason, 'end_turn')
+  assert.ok(calls >= 2, 'the probe should retry after a failed sample instead of giving up')
 })
