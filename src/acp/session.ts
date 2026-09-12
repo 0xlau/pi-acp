@@ -905,6 +905,18 @@ export class PiAcpSession {
         break
       }
 
+      case 'session_info_changed': {
+        const title = stringProp(ev, 'name')
+        if (title !== null) {
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            title,
+            updatedAt: new Date().toISOString()
+          })
+        }
+        break
+      }
+
       case 'extension_ui_request': {
         void this.handleExtensionUiRequest(ev).catch(() => {
           const id = stringProp(ev, 'id')

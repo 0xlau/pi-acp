@@ -62,6 +62,30 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   })
 })
 
+test('PiAcpSession: forwards Pi session name changes to ACP session info', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'session_info_changed', name: 'Rename from pi-title' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates[0]!.sessionId, 's1')
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'session_info_update')
+  assert.equal((conn.updates[0]!.update as any).title, 'Rename from pi-title')
+  assert.ok(typeof (conn.updates[0]!.update as any).updatedAt === 'string')
+})
+
 test('PiAcpSession: emits tool_call + tool_call_update + completes', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
