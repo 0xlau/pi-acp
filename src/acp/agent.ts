@@ -63,6 +63,24 @@ type AdvertisedModel = {
 const MODEL_CONFIG_ID = 'model'
 const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
 
+function validateAdditionalDirectories(value: unknown): string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) {
+    throw RequestError.invalidParams('additionalDirectories must be an array of absolute paths')
+  }
+
+  return value.map((directory, index) => {
+    if (typeof directory !== 'string' || !directory.trim() || !isAbsolute(directory)) {
+      throw RequestError.invalidParams(`additionalDirectories[${index}] must be a non-empty absolute path`)
+    }
+    return directory
+  })
+}
+
+function samePaths(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((path, index) => path === b[index])
+}
+
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
     {
@@ -162,10 +180,16 @@ export class PiAcpAgent implements ACPAgent {
     this.store.delete(sessionId)
   }
 
-  private findStoredSession(sessionId: string): { cwd: string; sessionFile: string } | null {
+  private findStoredSession(
+    sessionId: string
+  ): { cwd: string; additionalDirectories: string[]; sessionFile: string } | null {
     const stored = this.store.get(sessionId)
     if (stored?.cwd && stored?.sessionFile) {
-      return { cwd: stored.cwd, sessionFile: stored.sessionFile }
+      return {
+        cwd: stored.cwd,
+        additionalDirectories: stored.additionalDirectories ?? [],
+        sessionFile: stored.sessionFile
+      }
     }
 
     const piSession = findPiSession(sessionId)
@@ -179,13 +203,18 @@ export class PiAcpAgent implements ACPAgent {
 
     return {
       cwd: piSession.cwd,
+      additionalDirectories: [],
       sessionFile: piSession.sessionFile
     }
   }
 
   private async restoreSession(
     sessionId: string,
-    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers'] }
+    opts?: {
+      cwd?: string
+      additionalDirectories?: string[]
+      mcpServers?: LoadSessionRequest['mcpServers']
+    }
   ): Promise<PiAcpSession> {
     const existing = this.sessions.maybeGet(sessionId)
     if (existing) return existing
@@ -200,11 +229,13 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       const cwd = opts?.cwd ?? stored.cwd
+      const additionalDirectories = opts?.additionalDirectories ?? stored.additionalDirectories
 
       let proc: PiRpcProcess
       try {
         proc = await PiRpcProcess.spawn({
           cwd,
+          ...(additionalDirectories.length ? { additionalDirectories } : {}),
           sessionPath: stored.sessionFile,
           piCommand: process.env.PI_ACP_PI_COMMAND
         })
@@ -218,6 +249,7 @@ export class PiAcpAgent implements ACPAgent {
       const fileCommands = loadSlashCommands(cwd)
       const session = this.sessions.getOrCreate(sessionId, {
         cwd,
+        additionalDirectories,
         mcpServers: opts?.mcpServers ?? [],
         conn: this.conn,
         proc,
@@ -227,7 +259,12 @@ export class PiAcpAgent implements ACPAgent {
       })
 
       this.lastSessionCwd = cwd
-      this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile })
+      this.store.upsert({
+        sessionId,
+        cwd,
+        ...(additionalDirectories.length ? { additionalDirectories } : {}),
+        sessionFile: stored.sessionFile
+      })
 
       return session
     })()
@@ -273,7 +310,8 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {},
-          delete: {}
+          delete: {},
+          additionalDirectories: {}
         }
       }
     }
@@ -284,6 +322,8 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
 
+    const additionalDirectories = validateAdditionalDirectories(params.additionalDirectories)
+
     this.lastSessionCwd = params.cwd
 
     const fileCommands = loadSlashCommands(params.cwd)
@@ -293,6 +333,7 @@ export class PiAcpAgent implements ACPAgent {
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
       cwd: params.cwd,
+      additionalDirectories,
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
@@ -917,9 +958,22 @@ export class PiAcpAgent implements ACPAgent {
     // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
     // emulate pi's `/resume` picker (project-scoped).
     const all = listPiSessions()
+    // `additionalDirectories` is newer than the SDK's ListSessionsRequest type. Keep this
+    // compatibility cast so a client that sends the experimental field can still filter it.
+    const requestWithAdditionalDirectories = params as ListSessionsRequest & { additionalDirectories?: unknown }
+    const requestedAdditionalDirectories =
+      requestWithAdditionalDirectories.additionalDirectories === undefined
+        ? undefined
+        : validateAdditionalDirectories(requestWithAdditionalDirectories.additionalDirectories)
 
     const effectiveCwd = (params as any).cwd ?? this.lastSessionCwd
-    const filtered = effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all
+    const filtered = all.filter(session => {
+      if (effectiveCwd && session.cwd !== effectiveCwd) return false
+      if (requestedAdditionalDirectories === undefined) return true
+
+      const stored = this.store.get(session.sessionId)
+      return samePaths(stored?.additionalDirectories ?? [], requestedAdditionalDirectories)
+    })
 
     // Cursor-based pagination (opaque cursor). For MVP, we use a simple numeric offset.
     // If cursor is invalid, treat as 0.
@@ -932,6 +986,7 @@ export class PiAcpAgent implements ACPAgent {
     const sessions: SessionInfo[] = page.map(s => ({
       sessionId: s.sessionId,
       cwd: s.cwd,
+      additionalDirectories: this.store.get(s.sessionId)?.additionalDirectories ?? [],
       title: s.title,
       updatedAt: s.updatedAt
     }))
@@ -945,6 +1000,7 @@ export class PiAcpAgent implements ACPAgent {
     if (!isAbsolute(params.cwd)) {
       throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
     }
+    const additionalDirectories = validateAdditionalDirectories(params.additionalDirectories)
 
     // If the client is re-loading a session that is already active, tear down the existing
     // pi subprocess so we can start fresh and re-advertise commands reliably.
@@ -962,6 +1018,7 @@ export class PiAcpAgent implements ACPAgent {
     const acpSettings = resolveAcpSettings(params.cwd)
     const session = await this.restoreSession(params.sessionId, {
       cwd: params.cwd,
+      additionalDirectories,
       mcpServers: params.mcpServers
     })
     const proc = session.proc
@@ -975,6 +1032,7 @@ export class PiAcpAgent implements ACPAgent {
     this.store.upsert({
       sessionId: params.sessionId,
       cwd: params.cwd,
+      ...(additionalDirectories.length ? { additionalDirectories } : {}),
       sessionFile: stored.sessionFile
     })
 

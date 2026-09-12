@@ -70,10 +70,24 @@ export type PiRpcEvent = Record<string, unknown>
 
 type SpawnParams = {
   cwd: string
+  /** Additional ACP workspace roots available to this pi session. */
+  additionalDirectories?: string[]
   /** Optional override for `pi` executable name/path */
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+}
+
+function additionalDirectoriesPrompt(cwd: string, additionalDirectories: string[]): string | undefined {
+  if (!additionalDirectories.length) return undefined
+
+  return [
+    '## Additional workspace roots',
+    `The primary working directory is \`${cwd}\`.`,
+    'This session also has the following workspace roots:',
+    ...additionalDirectories.map(path => `- \`${path}\``),
+    'These directories are part of the active workspace. Use absolute paths when accessing them, or change directory explicitly in shell commands. Relative paths remain relative to the primary working directory.'
+  ].join('\n')
 }
 
 export class PiRpcProcess {
@@ -135,6 +149,8 @@ export class PiRpcProcess {
     // Keep extensions + prompt templates enabled because ACP users may rely on them
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
+    const workspacePrompt = additionalDirectoriesPrompt(params.cwd, params.additionalDirectories ?? [])
+    if (workspacePrompt) args.push('--append-system-prompt', workspacePrompt)
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
     const child = spawn(cmd, args, {

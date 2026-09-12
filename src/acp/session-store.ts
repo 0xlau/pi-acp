@@ -5,6 +5,8 @@ import { getPiAcpSessionMapPath } from './paths.js'
 export type StoredSession = {
   sessionId: string
   cwd: string
+  /** Ordered additional workspace roots received from the ACP client. */
+  additionalDirectories?: string[]
   sessionFile: string
   updatedAt: string
 }
@@ -48,11 +50,12 @@ export class SessionStore {
     return db.sessions[sessionId] ?? null
   }
 
-  upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
+  upsert(entry: { sessionId: string; cwd: string; additionalDirectories?: string[]; sessionFile: string }): void {
     const db = loadFile(this.path)
     db.sessions[entry.sessionId] = {
       sessionId: entry.sessionId,
       cwd: entry.cwd,
+      ...(entry.additionalDirectories?.length ? { additionalDirectories: entry.additionalDirectories } : {}),
       sessionFile: entry.sessionFile,
       updatedAt: new Date().toISOString()
     }

@@ -33,6 +33,8 @@ import { toolResultToText } from './translate/pi-tools.js'
 
 type SessionCreateParams = {
   cwd: string
+  /** Ordered workspace roots received through ACP in addition to [cwd]. */
+  additionalDirectories?: string[]
   mcpServers: McpServer[]
   conn: AgentSideConnection
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
@@ -222,6 +224,7 @@ export class SessionManager {
     try {
       proc = await PiRpcProcess.spawn({
         cwd: params.cwd,
+        ...(params.additionalDirectories?.length ? { additionalDirectories: params.additionalDirectories } : {}),
         piCommand: params.piCommand
       })
     } catch (e) {
@@ -242,12 +245,18 @@ export class SessionManager {
     const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
 
     if (sessionFile) {
-      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
+      this.store.upsert({
+        sessionId,
+        cwd: params.cwd,
+        ...(params.additionalDirectories?.length ? { additionalDirectories: params.additionalDirectories } : {}),
+        sessionFile
+      })
     }
 
     const session = new PiAcpSession({
       sessionId,
       cwd: params.cwd,
+      additionalDirectories: params.additionalDirectories ?? [],
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
@@ -277,6 +286,7 @@ export class SessionManager {
     const session = new PiAcpSession({
       sessionId,
       cwd: params.cwd,
+      additionalDirectories: params.additionalDirectories ?? [],
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
@@ -293,6 +303,7 @@ export class SessionManager {
 export class PiAcpSession {
   readonly sessionId: string
   readonly cwd: string
+  readonly additionalDirectories: string[]
   readonly mcpServers: McpServer[]
 
   private startupInfo: string | null = null
@@ -338,6 +349,7 @@ export class PiAcpSession {
   constructor(opts: {
     sessionId: string
     cwd: string
+    additionalDirectories?: string[]
     mcpServers: McpServer[]
     proc: PiRpcProcess
     conn: AgentSideConnection
@@ -347,6 +359,7 @@ export class PiAcpSession {
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
+    this.additionalDirectories = opts.additionalDirectories ?? []
     this.mcpServers = opts.mcpServers
     this.proc = opts.proc
     this.conn = opts.conn
